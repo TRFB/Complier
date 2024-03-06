@@ -180,6 +180,9 @@ void shortCircuitDelete(vector<vector<pair<past,BasicBlock *>>> &ifConds,
 void setFirstCondBblock(vector<vector<pair<past,BasicBlock *>>> &ifConds,
                         vector<pair<past,BasicBlock *>> &ifBodys,BasicBlock *curBblock);
 past shortCircuitDeleteAst(past astnode);
+bool astUnaryIsConst(past astnode);
+past editUnaryOper(past astnode);
+void editUnaryExprInCond(past &astnode);
 
 Instruction * generateIR(past astnode,BasicBlock * curBblock){
     
@@ -189,7 +192,6 @@ Instruction * generateIR(past astnode,BasicBlock * curBblock){
     }
     switch(astnode->nodeType){
         case TRANSLATION_UNIT:{
-            
             IRs->addBlock(globalFunc->getname(), globalBasic);
             generateIR(astnode->left,globalBasic);
 
@@ -254,7 +256,8 @@ Instruction * generateIR(past astnode,BasicBlock * curBblock){
         case WHILE_STMT:{//记得对body基本块自我分裂
             astnode->left=editWhileCond(astnode->left);
            if(astnode->left->nodeType==BINARY_OPERATOR
-           ||astnode->left->nodeType==DECL_REF_EXPR){
+           ||astnode->left->nodeType==DECL_REF_EXPR
+           ||astnode->left->nodeType==ARRAY_SUBSCRIPT_EXPR){
                 if(astnode->left->ivalue==AND||astnode->left->ivalue==OR){
                     BasicBlock * bodyBblock=new BasicBlock("."+to_string(bblockNum++));
                     BasicBlock * resultBblock=new BasicBlock("."+to_string(bblockNum++));
@@ -353,6 +356,9 @@ Instruction * generateIR(past astnode,BasicBlock * curBblock){
                     curBblock->addIR(ir_jumpCond);
                     if(astnode->left->nodeType==DECL_REF_EXPR)
                         condDeclRef.push_back(astnode->left);
+                    if(astnode->left->nodeType==ARRAY_SUBSCRIPT_EXPR){
+                        condDeclRef.push_back(astnode->left);
+                    }
                     Instruction * tmp=generateIR(astnode->left,condBblock);
                     //返回的是tmpConstant，应该先优化while cond再开始生成
                     BinaryOperation * cmp=dynamic_cast<BinaryOperation *>(tmp);
@@ -385,7 +391,8 @@ Instruction * generateIR(past astnode,BasicBlock * curBblock){
                 }
            }
            else{
-                if(astnode->left->ivalue==0){generateIR(astnode->next, curBblock);}
+                if(astnode->left->nodeType==INTEGER_LITERAL&&astnode->left->ivalue==0
+                ||astnode->left->nodeType==FLOATING_LITERAL&&astnode->left->fvalue==0){generateIR(astnode->next, curBblock);}
                 else{
                     BasicBlock * bodyBblock=new BasicBlock("."+to_string(bblockNum++));
                     IRs->addBlock(curFunc->getname(), bodyBblock);
@@ -429,9 +436,9 @@ Instruction * generateIR(past astnode,BasicBlock * curBblock){
         case IF_STMT://记得修剪优化语法树
         {
             past tmp=astnode;
-            while(tmp->nodeType!=IF_STMT){
-                astnode->if_cond=editWhileCond(astnode->if_cond);
-                tmp=astnode->right;
+            while(tmp!=NULL&&tmp->nodeType==IF_STMT){
+                tmp->if_cond=editWhileCond(astnode->if_cond);
+                tmp=tmp->right;
             }
             astnode=shortCircuitDeleteAst(astnode);
             if(astnode->nodeType!=IF_STMT){
@@ -669,6 +676,7 @@ Instruction * generateIR(past astnode,BasicBlock * curBblock){
             
 			break;
 		case UNARY_OPERATOR:{
+            astnode=editUnaryOper(astnode);
             if(astnode->ivalue=='+'){
                 Instruction * ir=generateIR(astnode->left, curBblock);
                 generateIR(astnode->next, curBblock);
@@ -704,18 +712,32 @@ Instruction * generateIR(past astnode,BasicBlock * curBblock){
                     }
                 }
                 else if(Load * val=dynamic_cast<Load *>(ir)){
-                    Constant* cmpZero=new Constant(Type(val->gettReg()->type.type,0),0);
-                    if(val->gettReg()->type.type==INT){
+                    if(std::find(condDeclRef.begin(), condDeclRef.end(), astnode)!=condDeclRef.end()){
+                        Variable * result=new Variable(Type(I1,0),"%"+to_string(regNum++),curFunc);
+                        Type sRegType=val->gettReg()->getType();
+                        Constant * zeroConst=new Constant(Type(sRegType.type,0),(float)0.0);
+                        BinaryOperation * ir_cmp=new BinaryOperation(EQUAL,val->gettReg(),zeroConst,sRegType.type==FLOAT?FCMP:ICMP,result);
+                        curBblock->addIR(ir_cmp);
+                        generateIR(astnode->next, curBblock);
+                        return ir_cmp;
+                    }
+                    else{
+                        Constant* cmpZero=new Constant(Type(val->gettReg()->type.type,0),0);
                         Variable * result=new Variable(Type(I1,1),"%"+to_string(regNum++),curFunc);
-                        BinaryOperation * ir_bo=new BinaryOperation(SNE,val->gettReg(),cmpZero,ICMP,result);
+                        BinaryOperation * ir_bo=new BinaryOperation(NOT_EQUAL,val->gettReg(),cmpZero,
+                                        val->gettReg()->type.type==FLOAT?FCMP:ICMP,result);
                         curBblock->addIR(ir_bo);
-                        Variable * result2=new Variable(Type(I1,1),"%"+to_string(regNum++),curFunc);
+                        Variable * result2=new Variable(Type(I1,0),"%"+to_string(regNum++),curFunc);
                         Constant * trueConstant=new Constant(Type(I1,0),1);
                         BinaryOperation * ir_xor=new BinaryOperation(XOR,result,trueConstant,result2);
                         curBblock->addIR(ir_xor);
+                        Variable* result3=new Variable(Type(INT,0),"%"+to_string(regNum++),curFunc);
+                        TypeTran * ir_zext=new TypeTran(result2,result3,Type(INT,0),ZEXT);
+                        curBblock->addIR(ir_zext);
                         generateIR(astnode->next, curBblock);
-                        return ir_xor;
+                        return ir_zext;
                     }
+                    
                 }
             }
         }
@@ -804,8 +826,15 @@ past shortCircuitDeleteAst(past astnode){
     }
     else if(astnode->if_cond->nodeType==INTEGER_LITERAL&&astnode->if_cond->ivalue==0){
         astnode->right=shortCircuitDeleteAst(astnode->right);
-        past tmp=astnode->right;
-        tmp->next=astnode->next;
+        past tmp;
+        //if(0)在第一个时
+        if(astnode->right==NULL){
+            tmp=astnode->next;
+        }
+        else{
+            tmp=astnode->right;
+            tmp->next=astnode->next;
+        }
         freeAst_remainNext(astnode->if_cond);
         free(astnode);
         return tmp;
@@ -883,6 +912,12 @@ BasicBlock * get_WhileCond(vector<pair<past,BasicBlock *>> &whileCond,past astno
     if(astnode==NULL)
         return NULL;
     BasicBlock *bblock;
+    if(astnode->nodeType==ARRAY_SUBSCRIPT_EXPR){
+        condDeclRef.push_back(astnode);
+        bblock=new BasicBlock("."+to_string(bblockNum++));
+        whileCond.push_back(make_pair(astnode, bblock));
+        return bblock;
+    }
     if(astnode->nodeType==DECL_REF_EXPR){
         condDeclRef.push_back(astnode);
         bblock=new BasicBlock("."+to_string(bblockNum++));
@@ -933,6 +968,12 @@ BasicBlock * get_IfCond(vector<pair<past,BasicBlock *>> &ifCond,past astnode,Bas
      if(astnode==NULL)
         return NULL;
     BasicBlock *bblock;
+    if(astnode->nodeType==ARRAY_SUBSCRIPT_EXPR){
+        condDeclRef.push_back(astnode);
+        bblock=new BasicBlock("."+to_string(bblockNum++));
+        ifCond.push_back(make_pair(astnode, bblock));
+        return bblock;
+    }
     if(astnode->nodeType==DECL_REF_EXPR){
         condDeclRef.push_back(astnode);
         bblock=new BasicBlock("."+to_string(bblockNum++));
@@ -959,6 +1000,32 @@ BasicBlock * get_IfCond(vector<pair<past,BasicBlock *>> &ifCond,past astnode,Bas
         ifCond.push_back(make_pair(astnode, bblock));
         return bblock;
     }
+    else if(astnode->nodeType==UNARY_OPERATOR){
+        editUnaryExprInCond(astnode);
+        condDeclRef.push_back(astnode);
+        bblock=new BasicBlock("."+to_string(bblockNum++));
+        ifCond.push_back(make_pair(astnode, bblock));
+        return bblock;
+    }
+    else if(astnode->nodeType==INTEGER_LITERAL&&astnode->ivalue!=0){
+        past newnode=newIntLiteral(1);
+        bblock=new BasicBlock("."+to_string(bblockNum++));
+        ifCond.push_back(make_pair(newnode, bblock));
+        return bblock;
+    }
+    else if(astnode->nodeType==FLOATING_LITERAL&&astnode->fvalue!=0){
+        past newnode=newIntLiteral(1);
+        bblock=new BasicBlock("."+to_string(bblockNum++));
+        ifCond.push_back(make_pair(newnode, bblock));
+        return bblock;
+    }
+    else if(astnode->nodeType==INTEGER_LITERAL&&astnode->ivalue==0
+            ||astnode->nodeType==FLOATING_LITERAL&&astnode->fvalue==0){
+        past newnode=newIntLiteral(0);
+        bblock=new BasicBlock("."+to_string(bblockNum++));
+        ifCond.push_back(make_pair(newnode, bblock));
+        return bblock;
+        }
     else{
         preBblock=get_IfCond(ifCond, astnode->left,NULL);
         bblock=new BasicBlock("."+to_string(bblockNum++));
@@ -968,6 +1035,21 @@ BasicBlock * get_IfCond(vector<pair<past,BasicBlock *>> &ifCond,past astnode,Bas
     }
 }
 
+void editUnaryExprInCond(past &astnode){
+    int i=0;
+    past tmp=astnode;
+    while(tmp->nodeType==UNARY_OPERATOR){
+        if(tmp->ivalue=='!')
+            i++;
+        tmp=tmp->left;
+    }
+    if(i%2==0){
+        astnode=tmp;
+    }else{
+        past newnode=newUnaryExp('!', tmp);
+        astnode=newnode;
+    }
+}
 
 void get_ifConds_Bodys(past astnode,vector<vector<pair<past,BasicBlock *>>> &ifConds,vector<pair<past,BasicBlock *>> &ifBodys){
     if(astnode==NULL)
@@ -1539,9 +1621,10 @@ past editWhileCond(past astnode){
     if(astnode==NULL){
         return NULL;
     }
-    astnode->left=editWhileCond(astnode->left);
-    astnode->right=editWhileCond(astnode->right);
+    
     if(astnode->nodeType==BINARY_OPERATOR&&astnode->ivalue==AND){
+        astnode->left=editWhileCond(astnode->left);
+        astnode->right=editWhileCond(astnode->right);
         if(astnode->left->nodeType==DECL_REF_EXPR||astnode->left->nodeType==ARRAY_SUBSCRIPT_EXPR){
             astnode->left=editBinaryOper(astnode->left, scope);
         }
@@ -1576,6 +1659,9 @@ past editWhileCond(past astnode){
         }
     }
     else if(astnode->nodeType==BINARY_OPERATOR&&astnode->ivalue==OR){
+        astnode->left=editWhileCond(astnode->left);
+        astnode->right=editWhileCond(astnode->right);
+
         if(astnode->left->nodeType==DECL_REF_EXPR||astnode->left->nodeType==ARRAY_SUBSCRIPT_EXPR){
             astnode->left=editBinaryOper(astnode->left, scope);
         }
@@ -1583,8 +1669,6 @@ past editWhileCond(past astnode){
         if(astnode->right->nodeType==DECL_REF_EXPR||astnode->right->nodeType==ARRAY_SUBSCRIPT_EXPR){
             astnode->right=editBinaryOper(astnode->right, scope);
         }
-        
-
         if(isFalse(astnode->left)){
             free(astnode->left);
             past tmp=astnode->right;
@@ -1610,9 +1694,11 @@ past editWhileCond(past astnode){
             return tmp;
         }
     }
-    else if(astnode->nodeType==BINARY_OPERATOR){
-        return editBinaryOper(astnode, scope);
+    else if(astnode->nodeType==BINARY_OPERATOR||astnode->nodeType==UNARY_OPERATOR){
+        past newnode=editBinaryOper(astnode, scope);
+        return newnode;
     }
+    
     return astnode;
     
 }
@@ -1643,7 +1729,8 @@ int getTypeAST(past astnode,Scope * scope){
 }
 
 past calcConstAst(past astnode,Scope * scope){
-    int type1,type2;
+    if(astnode->nodeType==BINARY_OPERATOR){
+        int type1,type2;
     past opdNode1=astnode->left;
     past opdNode2=astnode->right;
     type1=getTypeAST(opdNode1, scope);
@@ -1972,6 +2059,54 @@ past calcConstAst(past astnode,Scope * scope){
         }
         default: break;
     }
+    }
+    else if(astnode->nodeType==UNARY_OPERATOR){
+        past opdNode=calcConstAst(astnode->left, scope);
+        int type=getTypeAST(opdNode, scope);
+        past newnode;
+        switch(astnode->ivalue){
+            case '+':{
+                return astnode->left;
+                break;
+            }
+            case '-':{
+                if(type==INT){
+                    newnode=newIntLiteral(-opdNode->ivalue);
+                    free(opdNode);
+                    free(astnode);
+                    return newnode;
+                    break;
+                }
+                else if(type==FLOAT){
+                    newnode=newFloatLiteral(-opdNode->fvalue);
+                    free(opdNode);
+                    free(astnode);
+                    return newnode;
+                    break;
+                }
+            }
+            case '!':{
+                if(type==INT){
+                    newnode=newIntLiteral(!opdNode->ivalue);
+                    free(opdNode);
+                    free(astnode);
+                    return newnode;
+                    break;
+                }
+                else if(type==FLOAT){
+                    newnode=newIntLiteral(!opdNode->fvalue);
+                    free(opdNode);
+                    free(astnode);
+                    return newnode;
+                    break;
+                }
+            }
+            default: break;
+        }
+    }
+    else{
+        return astnode;
+    }
 }
 
 past editBinaryOper(past astnode,Scope* scope){
@@ -2031,10 +2166,74 @@ past editBinaryOper(past astnode,Scope* scope){
             return astnode;
         }
     }
+    else if(astnode->nodeType==UNARY_OPERATOR){
+        astnode=editUnaryOper(astnode);
+        if(astUnaryIsConst(astnode)){
+            astnode=calcConstAst(astnode, scope);
+        }
+        return astnode;
+    }
     else if(astnode->nodeType==PAREN_EXPR){
         astnode->left=editBinaryOper(astnode->left, scope);
     }
     else{
+        return astnode;
+    }
+}
+
+bool astUnaryIsConst(past astnode){
+    if(astnode->nodeType==UNARY_OPERATOR){
+        while(astnode->nodeType==UNARY_OPERATOR){
+            astnode=astnode->left;
+        }
+        return astnodeIsConst(astnode, scope);
+    }
+    else return astnode;
+}
+
+past editUnaryOper(past astnode){
+    past leftnode=editBinaryOper(astnode->left,scope);
+    astnode->left=leftnode;
+    if(leftnode->nodeType==UNARY_OPERATOR){
+        if(astnode->ivalue=='+'){
+            free(astnode);
+            return leftnode;
+        }
+        else if(astnode->ivalue=='-'){
+            if(leftnode->ivalue=='+'){
+                leftnode->ivalue='-';
+                free(astnode);
+                return leftnode;
+            }
+            else if(leftnode->ivalue=='-'){
+                leftnode->ivalue='+';
+                free(astnode);
+                past tmp=leftnode->left;
+                free(leftnode);
+                return tmp;
+            }
+            else if(leftnode->ivalue=='!'){
+                return astnode;
+            }
+        }
+        else if(astnode->ivalue=='!'){
+            if(leftnode->ivalue=='-'||leftnode->ivalue=='+'){
+                past tmp=leftnode->left;
+                free(leftnode);
+                astnode->left=tmp;
+                return astnode;
+            }
+            else if(leftnode->ivalue=='!'){
+                past tmp=leftnode->left;
+                free(astnode);
+                free(leftnode);
+                return tmp;
+            }
+        }
+    }
+    
+    else{
+        //astnode=editBinaryOper(astnode, scope);
         return astnode;
     }
 }
@@ -2188,7 +2387,56 @@ Instruction * generateIR_Tran(BasicBlock* bblock,Instruction * sir,Type ttype){
             return sir;
         }
     }
+    if(TypeTran * ir_var=dynamic_cast<TypeTran *>(sir)){
+        if(ir_var->gettReg()->getType().arraysubs.size()!=0){
 
+        }
+        else{
+            if(ir_var->gettReg()->getType().type==INT&&ttype.type==FLOAT){
+                Variable * newvar=new Variable(Type(FLOAT,0),"%"+to_string(regNum++),curFunc);
+                TypeTran * tir=new TypeTran(ir_var->gettReg(),newvar,newvar->type,SITOFP);
+                bblock->addIR(tir);
+                return tir;
+            }
+            if(ir_var->gettReg()->getType().type==INT&&ttype.type==I1){
+                Variable * newvar=new Variable(Type(I1,0),"%"+to_string(regNum++),curFunc);
+                TypeTran * tir=new TypeTran(ir_var->gettReg(),newvar,newvar->type,TRUNC);
+                bblock->addIR(tir);
+                return tir;
+            }
+            if(ir_var->gettReg()->getType().type==FLOAT&&ttype.type==INT){
+                Variable * newvar=new Variable(Type(INT,0),"%"+to_string(regNum++),curFunc);
+                TypeTran * tir=new TypeTran(ir_var->gettReg(),newvar,newvar->type,FPTOSI);
+                bblock->addIR(tir);
+                return tir;
+            }
+            if(ir_var->gettReg()->getType().type==FLOAT&&ttype.type==I1){
+                Variable * newvar=new Variable(Type(I1,0),"%"+to_string(regNum++),curFunc);
+                TypeTran * tir=new TypeTran(ir_var->gettReg(),newvar,newvar->type,TRUNC);
+                bblock->addIR(tir);
+                return tir;
+            }
+            if(ir_var->gettReg()->getType().type==I1&&ttype.type==INT){
+                Variable * newvar=new Variable(Type(INT,0),"%"+to_string(regNum++),curFunc);
+                TypeTran * tir=new TypeTran(ir_var->gettReg(),newvar,newvar->type,ZEXT);
+                bblock->addIR(tir);
+                return tir;
+            }
+            if(ir_var->gettReg()->getType().type==I1&&ttype.type==FLOAT){
+                Variable * newvar=new Variable(Type(FLOAT,0),"%"+to_string(regNum++),curFunc);
+                TypeTran * tir=new TypeTran(ir_var->gettReg(),newvar,newvar->type,ZEXT);
+                bblock->addIR(tir);
+                return tir;
+            }
+            if(ir_var->gettReg()->getType().type==INT&&ttype.type==FLOAT){
+                Variable * newvar=new Variable(Type(FLOAT,0),"%"+to_string(regNum++),curFunc);
+                TypeTran * tir=new TypeTran(ir_var->gettReg(),newvar,newvar->type,SITOFP);
+                bblock->addIR(tir);
+                return tir;
+            }
+            return sir;
+        }
+    }
     return sir;
 }
 

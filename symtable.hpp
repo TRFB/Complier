@@ -82,7 +82,7 @@ private:
 class Constant : public SymbolEntry {
 public:
     Constant(){};
-    Constant(Type,float value);
+    Constant(Type type,float value);
     Constant(Type type, Val value)
         : type(type), val(value) {}
     Constant(Type type, int value)
