@@ -162,7 +162,8 @@ FuncParam: Type IDENT {$$=newParmVarDecl($1,NULL,$2);}
                                     $$->arraysubs=arraySubs;
                                     arraySubs.clear();}
     | Type IDENT '[' ']' ArraySubscripts {past arrsub=newParmArray();
-                                        arrsub->right=$5;
+                                       past righttail=findRTail($5);
+                                       righttail->right=arrsub;
                                         $$=newParmVarDecl($1,$5,$2);
                                         $$->arraysubs=arraySubs;
                                         arraySubs.clear();}

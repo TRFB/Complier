@@ -40,6 +40,10 @@ using std::make_pair;
 //在while中测试更加复杂的条件表达式、数组在条件表达式中的出现
 //while与if嵌套的调试
 //if的短路问题
+//函数调用
+
+//全局变量数组0的填充
+//全局变量初始值的加入
 
 Function * globalFunc=new Function(string("0GLOBAL"),Type(VOID,0));
 Function * curFunc=globalFunc;
@@ -125,6 +129,7 @@ int BinaryOperation::optran(int sop){
     if(sop=='*') return MUL;
     if(sop=='/') return DIV;
     if(sop=='%') return MOD;
+    if(sop==XOR) return XOR;
     if(sop=='<'&&cmptype==ICMP) return SLT;
     if(sop=='<'&&cmptype==FCMP) return OLT;
     if(sop=='>'&&cmptype==ICMP) return SGT;
@@ -157,7 +162,7 @@ void generateIR_IfBodys(vector<pair<past,BasicBlock*>> &ifBodys,BasicBlock* next
 int getCmpOp(int op,Type leftType,Type rightType);
 vector<int> getDimen(past astnode);
 int calcDimen(past astnode);
-void  generateIR_InitList(past astnode,BasicBlock * curBblock,int index,Variable * array);
+void  generateIR_InitList(past astnode,BasicBlock * curBblock,int index,Variable * array,sVar * svar);
 Instruction * generateIR_BinaryOper(past astnode,BasicBlock *curBblock);
 SymbolEntry * getParam(past astnode,BasicBlock * curBblock,int index,Function * func);
 Instruction * generateIR_Param_Array(past astnode,BasicBlock * curBblock);
@@ -183,6 +188,11 @@ past shortCircuitDeleteAst(past astnode);
 bool astUnaryIsConst(past astnode);
 past editUnaryOper(past astnode);
 void editUnaryExprInCond(past &astnode);
+vector<int> getDimenReverse(past astnode);
+Type getParamType(past astnode);
+bool isDeclDimenFull(past astnode);
+void generateIR_IfBody(vector<pair<past,BasicBlock*>> &ifBodys,
+                        vector<pair<past,BasicBlock*>>::iterator ifBody,BasicBlock * nextBblock);
 
 Instruction * generateIR(past astnode,BasicBlock * curBblock){
     
@@ -199,41 +209,57 @@ Instruction * generateIR(past astnode,BasicBlock * curBblock){
             }
             break;
         case FUNCTION_DECL:{
+            bblockNum=0;
+            regNum=0;
             //建立新的基本块
             BasicBlock * bblock=new BasicBlock("."+to_string(bblockNum++));
             curBblock=bblock;
             //设置作用域与形参，形参稍后加入符号表
-            regNum=0;
-            Function * function= new Function(astnode->svalue,Type(astnode->type,0));
+            
+            Function * function= new Function("@"+string(astnode->svalue),Type(astnode->type,0));
             curFunc=function;
             symbolTable->addFunc(curFunc->getname(),curFunc);
             IRs->addBlock(curFunc->getname(), curBblock);
+            //新建作用域
+            Scope * tmpScope=new Scope();
+            tmpScope->setPreScope(scope);
+            scope=tmpScope;
             
-            past tmp=astnode->left;
-            while(tmp!=NULL){
-                (*function).addParm(Type(tmp->type,tmp->arraysubs,0));
-                tmp=tmp->next;
-            }
+
+
+            //past tmp=astnode->left;
+            //while(tmp!=NULL){
+            //    (*function).addParm(getParamType(tmp),regNum++);
+            //    tmp=tmp->next;
+            //}
             //生成IR
             //形参赋值
-            int parmNum=regNum+1;
+            past tmp=astnode->left;
+            while(tmp!=NULL){
+                regNum++;
+                tmp=tmp->next;
+            }
+            int parmNum=0;
             tmp=astnode->left;
             while(tmp!=NULL){
-                string sRegName="%"+std::to_string(parmNum+regNum);
-                regNum++;
-                Variable * sReg=new Variable(Type(tmp->type,tmp->arraysubs,1),sRegName,curFunc);
-                Alloca * ir=new Alloca(
-                    Type(tmp->type,tmp->arraysubs,1),sReg);
-                    sVar * tmpsVar=new sVar(sReg);
-                //store语句稍后补上
-                    scope->addVar(astnode->svalue,tmpsVar);
-                curBblock->addIR(ir);
+                Type paramType=getParamType(tmp);
+                curFunc->paramsType.push_back(paramType);
+                Type tRegType=paramType;
+                tRegType.ptrDimen+=1;
+                Variable * tReg=new Variable(tRegType,"%"+to_string(regNum++),curFunc);
+                curFunc->addParm(tReg);
+                Alloca * ir_alloca=new Alloca(paramType,tReg);
+                Variable * paramReg=new Variable(paramType,"%"+to_string(parmNum++),curFunc);
+                Store * ir_store=new Store(tReg,paramReg);
+                sVar * tmpsVar=new sVar(tReg);
+                scope->addVar(tmp->svalue,tmpsVar);
+                curBblock->addIR(ir_alloca);
+                curBblock->addIR(ir_store);
+                tmp=tmp->next;
             }
-            
-            generateIR(astnode->right,curBblock);
-            if(astnode->next==NULL||astnode->next->nodeType!=FUNCTION_DECL){
-                curFunc=globalFunc;
-            }
+            generateIR(astnode->right->left,curBblock);
+            //退出时重置作用域
+            scope=scope->getpre();
             generateIR(astnode->next,globalBasic);
             regNum=0;
             bblockNum=0;
@@ -271,7 +297,7 @@ Instruction * generateIR(past astnode,BasicBlock * curBblock){
                     get_WhileCond(whileCond,astnode->left,NULL);
                     
                     continueBblock.push_back((*whileCond.begin()).second);
-                    //breakBblock.push_back(nextBblock);
+                    breakBblock.push_back(nextBblock);
 
                     Jump * ir_jumpCond=new Jump((*whileCond.begin()).second);
                     curBblock->addIR(ir_jumpCond);
@@ -327,7 +353,16 @@ Instruction * generateIR(past astnode,BasicBlock * curBblock){
                         generateIR(astnode->right, bodyBblock);
                         scope=scope->getpre();
                     }
-                    IRs->addBlock(curFunc->getname(), nextBblock);
+                    
+
+                    BasicBlock * lastBodyBblock=IRs->irs[curFunc->getname()].back();
+                    if(Jump * ir_last=dynamic_cast<Jump *>(lastBodyBblock->lastInstruction())){
+                        ;
+                    }
+                    else{
+                        lastBodyBblock->addIR(ir_jumpCond);
+                    }
+                    /*
                     if(Jump * ir_last=dynamic_cast<Jump *>(bodyBblock->lastInstruction())){
                         if(ir_last->getBblock()==whileCond.begin()->second){
                             ;
@@ -337,9 +372,12 @@ Instruction * generateIR(past astnode,BasicBlock * curBblock){
                         }
                     }
                     else{
-                        bodyBblock->addIR(ir_jumpCond);
+                        IRs->irs[curFunc->getname()].back()->addIR(ir_jumpCond);
                     }
+                    */
                     continueBblock.pop_back();
+                    breakBblock.pop_back();
+                    IRs->addBlock(curFunc->getname(), nextBblock);
                     generateIR(astnode->next,nextBblock);
                 }
                 else{ 
@@ -350,7 +388,7 @@ Instruction * generateIR(past astnode,BasicBlock * curBblock){
                     BasicBlock * nextBblock=new BasicBlock("."+to_string(bblockNum++));
 
                     continueBblock.push_back(condBblock);
-                    //breakBblock.push_back(nextBblock);
+                    breakBblock.push_back(nextBblock);
 
                     Jump* ir_jumpCond=new Jump(condBblock);
                     curBblock->addIR(ir_jumpCond);
@@ -373,7 +411,16 @@ Instruction * generateIR(past astnode,BasicBlock * curBblock){
                         generateIR(astnode->right, bodyBblock);
                         scope=scope->getpre();
                     }
-                    IRs->addBlock(curFunc->getname(), nextBblock);
+                    
+                    BasicBlock * lastBodyBblock=IRs->irs[curFunc->getname()].back();
+                    if(Jump * ir_last=dynamic_cast<Jump *>(lastBodyBblock->lastInstruction())){
+                        ;
+                    }
+                    else{
+                        lastBodyBblock->addIR(ir_jumpCond);
+                    }
+
+                    /*
                     if(Jump * ir_last=dynamic_cast<Jump *>(bodyBblock->lastInstruction())){
                         if(ir_last->getBblock()==condBblock){
                             ;
@@ -383,9 +430,11 @@ Instruction * generateIR(past astnode,BasicBlock * curBblock){
                         }
                     }
                     else{
-                        bodyBblock->addIR(ir_jumpCond);
-                    }
+                        IRs->irs[curFunc->getname()].back()->addIR(ir_jumpCond);
+                    }*/
                     continueBblock.pop_back();
+                    breakBblock.pop_back();
+                    IRs->addBlock(curFunc->getname(), nextBblock);
                     generateIR(astnode->next, nextBblock);
                     
                 }
@@ -399,7 +448,7 @@ Instruction * generateIR(past astnode,BasicBlock * curBblock){
                     BasicBlock * nextBblock=new BasicBlock("."+to_string(bblockNum++));
 
                     continueBblock.push_back(bodyBblock);
-                    //breakBblock.push_back(nextBblock);
+                    breakBblock.push_back(nextBblock);
 
                     Jump * ir_jumpBody=new Jump(bodyBblock);
                     curBblock->addIR(ir_jumpBody);
@@ -412,6 +461,15 @@ Instruction * generateIR(past astnode,BasicBlock * curBblock){
                         generateIR(astnode->right, bodyBblock);
                         scope=scope->getpre();
                     }
+
+                    BasicBlock * lastBodyBblock=IRs->irs[curFunc->getname()].back();
+                    if(Jump * ir_last=dynamic_cast<Jump *>(lastBodyBblock->lastInstruction())){
+                        ;
+                    }
+                    else{
+                        lastBodyBblock->addIR(ir_jumpBody);
+                    }
+                    /*
                     if(Jump * ir_last=dynamic_cast<Jump *>(bodyBblock->lastInstruction())){
                         if(ir_last->getBblock()==bodyBblock){
                             ;
@@ -421,10 +479,12 @@ Instruction * generateIR(past astnode,BasicBlock * curBblock){
                         }
                     }
                     else{
-                        bodyBblock->addIR(ir_jumpBody);
+                        IRs->irs[curFunc->getname()].back()->addIR(ir_jumpBody);
                     }
+                    */
                     IRs->addBlock(curFunc->getname(), nextBblock);
                     continueBblock.pop_back();
+                    breakBblock.pop_back();
                     generateIR(astnode->next, nextBblock);
                 }
            }
@@ -483,6 +543,20 @@ Instruction * generateIR(past astnode,BasicBlock * curBblock){
                 nextBblock=new BasicBlock("."+to_string(bblockNum++));
             }
 
+            ifCond=ifConds.begin();
+            ifBody=ifBodys.begin();
+            for(;ifCond!=ifConds.end();++ifCond,++ifBody){
+                if((*ifCond).size()==1&&(*ifCond)[0]==ifBodys.back())
+                    ;
+                else{
+                    generateIR_IfCond(ifConds,ifCond,ifBodys,nextBblock);
+                }
+                generateIR_IfBody(ifBodys, ifBody,nextBblock);
+            }
+            /*
+
+
+
 
             generateIR_IfConds(ifConds,ifBodys,nextBblock);
             generateIR_IfBodys(ifBodys,nextBblock);
@@ -499,6 +573,7 @@ Instruction * generateIR(past astnode,BasicBlock * curBblock){
                 }
                 IRs->addBlock(curFunc->getname(), ifBody->second);
             }
+            */
             IRs->addBlock(curFunc->getname(), nextBblock);
             generateIR(astnode->next,nextBblock);
             return NULL;
@@ -507,7 +582,7 @@ Instruction * generateIR(past astnode,BasicBlock * curBblock){
 
 			break;
 		case CONTINUE_STMT:{
-            Jump * ir_jump=new Jump(*(continueBblock.end()-1));
+            Jump * ir_jump=new Jump(continueBblock.back());
             curBblock->addIR(ir_jump);
             //BasicBlock * newBblock=new BasicBlock("."+to_string(bblockNum++));
             //IRs->addBlock(curFunc->getname(), newBblock);
@@ -516,11 +591,11 @@ Instruction * generateIR(past astnode,BasicBlock * curBblock){
         }
 			break;
 		case BREAK_STMT:{
-            Jump * ir_jump=new Jump(*breakBblock.end());
+            Jump * ir_jump=new Jump(breakBblock.back());
             curBblock->addIR(ir_jump);
-            BasicBlock * newBblock=new BasicBlock("."+to_string(bblockNum++));
-            IRs->addBlock(curFunc->getname(), newBblock);
-            generateIR(astnode->next,newBblock);
+            //BasicBlock * newBblock=new BasicBlock("."+to_string(bblockNum++));
+            //IRs->addBlock(curFunc->getname(), newBblock);
+            //generateIR(astnode->next,newBblock);
             return ir_jump;
         }
 
@@ -621,10 +696,12 @@ Instruction * generateIR(past astnode,BasicBlock * curBblock){
 			break;
 		case VAR_DECL:{
             string varName;
+            /*
             if(scope->isGlobal()){
                 varName="@"+string(astnode->svalue);
                 Variable * varible=new Variable(Type(astnode->type,getDimen(astnode->left),1),varName,curFunc);
                 sVar* svar=new sVar(varible);
+                scope->addVar(astnode->svalue,svar);
                 if(astnode->right!=NULL)
                     svar->getInitVals(varible->type.arraysubs, astnode->right,scope);
                 Constant * initValue;
@@ -640,23 +717,33 @@ Instruction * generateIR(past astnode,BasicBlock * curBblock){
                 generateIR(astnode->next,curBblock);
                 return ir_global;
             }
-            else{
-                varName="%"+std::to_string(regNum);
-                regNum++;
+            else*/{
+                if(scope->isGlobal()){
+                    varName="@"+string(astnode->svalue);
+                }
+                else{
+                    varName="%"+std::to_string(regNum++);
+                }
                 Variable * varible=new Variable(Type(astnode->type,getDimen(astnode->left),1),varName,curFunc);
                 sVar * svar;
                 svar=new sVar(varible);
-                scope->addVar(astnode->svalue, svar);
-                Alloca * ir_alloca=new Alloca(varible->type,varible);
+                Type allocaType=varible->type;
+                if(varible->type.ptrDimen>=1){
+                    allocaType.ptrDimen--;
+                }
+                Alloca * ir_alloca=new Alloca(allocaType,varible);
                 curBblock->addIR(ir_alloca);
                 if(astnode->right==NULL){//声明变量但没有初始值
+                    scope->addVar(astnode->svalue, svar);
                     generateIR(astnode->next,curBblock);
                     return ir_alloca;;
                 }
                 else if(astnode->right->nodeType==INIT_LIST_EXPR){//局部数组的初始化
                     initListing=true;
-                    generateIR_InitList(astnode->right,curBblock,0,varible);
+                    generateIR_InitList(astnode->right,curBblock,0,varible,svar);
+                    scope->addVar(astnode->svalue, svar);
                     initListing=false;
+                    generateIR(astnode->next,curBblock);
                 }
                 else{//用数组引用、变量引用、常量初始化
                     astnode->right=editBinaryOper(astnode->right, scope);
@@ -665,9 +752,12 @@ Instruction * generateIR(past astnode,BasicBlock * curBblock){
                     Store * ir_store=new Store(varible,getOpd(ir_val));
                     curBblock->addIR(ir_store);
                     if(tmpConstant * ir_const=dynamic_cast<tmpConstant*>(ir_val)){
-                        Constant* initVal=new Constant(ir_const->getType(),ir_const->getVal()->val);
-                        if(astnode->type==const_float||astnode->type==const_int) svar->initVal=initVal;
+                        if(varible->type.isConst||scope==globalScope){
+                            Constant* initVal=new Constant(ir_const->getType(),ir_const->getVal()->val);
+                            svar->initVal=initVal;
+                        }
                     }
+                    scope->addVar(astnode->svalue, svar);
                     generateIR(astnode->next,curBblock);
                     return ir_alloca;
                 }
@@ -744,11 +834,13 @@ Instruction * generateIR(past astnode,BasicBlock * curBblock){
             
 			break;
 		case CALL_EXPR:{
-            CallStmt * ir_call=new CallStmt(symbolTable->lookupFunc(astnode->right->svalue));
+            CallStmt * ir_call=new CallStmt(symbolTable->lookupFunc("@"+string(astnode->left->svalue)));
             past tmp=astnode->right;
+            int index=0;
             while(tmp!=NULL){
-                ir_call->addParams(getParam(tmp,curBblock,0,symbolTable->lookupFunc(astnode->right->svalue)));
+                ir_call->addParams(getParam(tmp,curBblock,index,symbolTable->lookupFunc("@"+string(astnode->left->svalue))));
                 tmp=tmp->next;
+                index++;
             }
             if(curFunc->getRetType().type!=VOID){
                 Variable * retVal=new Variable(curFunc->getRetType(),
@@ -758,6 +850,7 @@ Instruction * generateIR(past astnode,BasicBlock * curBblock){
             else{
                 ir_call->setRetVal(NULL);
             }
+            curBblock->addIR(ir_call);
             generateIR(astnode->next, curBblock);
             return ir_call;
         }
@@ -767,7 +860,9 @@ Instruction * generateIR(past astnode,BasicBlock * curBblock){
             if(arrayIsConst(astnode)){
                 pair<int,sVar*> info=getArrayIndex(astnode, 0);
                 if(info.second->initVals.find(info.first)==info.second->initVals.end()){
-                    ;
+                    tmpConstant *ir_const=new tmpConstant(Type(info.second->firstReg->type.type,0),0);
+                    generateIR(astnode->next, curBblock);
+                    return ir_const;
                 }
                 else{
                     tmpConstant *ir_const=new tmpConstant(info.second->initVals[info.first]->getType(),
@@ -778,7 +873,7 @@ Instruction * generateIR(past astnode,BasicBlock * curBblock){
             }
             Instruction * ir_tmp=generateIR_Param_Array(astnode,curBblock);
             if(GetElementPtr * ir_ptr=dynamic_cast<GetElementPtr *>(ir_tmp)){
-                Variable * sReg=ir_ptr->getTptr();
+                Variable * sReg=ir_ptr->gettReg();
                 Variable * tReg=new Variable(Type(sReg->type.type,0),"%"+to_string(regNum++),curFunc);
                 Load * ir_load=new Load(tReg,sReg);
                 curBblock->addIR(ir_load);
@@ -1091,6 +1186,7 @@ void generateIR_IfCond(vector<vector<pair<past,BasicBlock *>>> &ifConds,
     for (auto it = (*ifCond).begin(); it != (*ifCond).end(); ++it) {
         switch((*it).first->ivalue){
             case AND:{
+                IRs->addBlock(curFunc->getname(), (*it).second);
                 BasicBlock * jumpBblock=get_if_And_falseBblock(ifConds,ifCond,it,nextBblock);
                 Instruction * tmp=(*it).second->lastInstruction();
                 BinaryOperation * cmp=dynamic_cast<BinaryOperation *>(tmp);
@@ -1101,6 +1197,7 @@ void generateIR_IfCond(vector<vector<pair<past,BasicBlock *>>> &ifConds,
                 break;
             }
             case OR:{
+                IRs->addBlock(curFunc->getname(), (*it).second);
                 Instruction * tmp=(*it).second->lastInstruction();
                 BinaryOperation * cmp=dynamic_cast<BinaryOperation *>(tmp);
                 vector<pair<past, BasicBlock *>>::iterator next=it+1;
@@ -1111,6 +1208,7 @@ void generateIR_IfCond(vector<vector<pair<past,BasicBlock *>>> &ifConds,
                 break;
                 }    
                 default:
+                    IRs->addBlock(curFunc->getname(), (*it).second);
                     generateIR((*it).first,(*it).second);
                     //IRs->addBlock(curFunc->getname(), (*it).second);
                     break;
@@ -1163,7 +1261,7 @@ void generateIR_IfConds(vector<vector<pair<past,BasicBlock *>>> &ifConds,
         generateIR_IfCond(ifConds,ifCond,ifBodys,nextBblock);
     }
 }
-
+//按顺序加入基本块，ir_jump加在最后一个基本块
 void generateIR_IfBodys(vector<pair<past,BasicBlock*>> &ifBodys,BasicBlock* nextBblock){
     for (auto ifBody = ifBodys.begin(); ifBody != ifBodys.end(); ++ifBody){
         generateIR(ifBody->first,ifBody->second);
@@ -1171,13 +1269,39 @@ void generateIR_IfBodys(vector<pair<past,BasicBlock*>> &ifBodys,BasicBlock* next
             ;
         }
         else{
-            Jump* ir_jump=new Jump(nextBblock);
-            ifBody->second->addIR(ir_jump);
+            if(Jump * ir_last=dynamic_cast<Jump *>(ifBody->second->lastInstruction())){
+                continue;
+            }
+            else{
+                Jump* ir_jump=new Jump(nextBblock);
+                ifBody->second->addIR(ir_jump);
+            }
         }
         
     }
     return ;
 }
+
+void generateIR_IfBody(vector<pair<past,BasicBlock*>> &ifBodys,
+                        vector<pair<past,BasicBlock*>>::iterator ifBody,BasicBlock * nextBblock){
+    IRs->addBlock(curFunc->getname(), ifBody->second);
+    generateIR(ifBody->first,ifBody->second);
+        if(nextBblock==(*(ifBodys.end()-1)).second){
+            ;
+        }
+        else{
+            if(Jump * ir_last=dynamic_cast<Jump *>(ifBody->second->lastInstruction())){
+                ;
+            }
+            else{
+                Jump* ir_jump=new Jump(nextBblock);
+                BasicBlock * lastBblock=IRs->irs[curFunc->getname()].back();
+                lastBblock->addIR(ir_jump);
+            }
+        }
+        
+}
+
 
 Instruction * generateIR_BinaryOper(past astnode,BasicBlock *curBblock){
     switch(astnode->ivalue){
@@ -1371,7 +1495,7 @@ Variable * generateIR_Lval(past astnode,BasicBlock * curBblock){
     if(astnode->nodeType==ARRAY_SUBSCRIPT_EXPR){
         Instruction * ir_tmp=generateIR_Param_Array(astnode,curBblock);
         if(GetElementPtr * ir_ptr=dynamic_cast<GetElementPtr *>(ir_tmp)){
-            Variable * lval=ir_ptr->getTptr();
+            Variable * lval=ir_ptr->gettReg();
             return lval;
         }
     }
@@ -1392,6 +1516,12 @@ SymbolEntry * getOpd(Instruction * sir){
     if(TypeTran * tir=dynamic_cast<TypeTran *>(sir)){
         opd=tir->gettReg();
     }
+    if(CallStmt * tir=dynamic_cast<CallStmt *>(sir)){
+        opd=tir->gettReg();
+    }
+    if(GetElementPtr * tir=dynamic_cast<GetElementPtr *>(sir)){
+        opd=tir->gettReg();
+    }
     return opd;
 }
 
@@ -1404,6 +1534,9 @@ Type getOpdType(Instruction * sir){
         opdType=tir->gettReg()->getType();
     }
     if(BinaryOperation * tir=dynamic_cast<BinaryOperation *>(sir)){
+        opdType=tir->gettReg()->getType();
+    }
+    if(CallStmt * tir=dynamic_cast<CallStmt *>(sir)){
         opdType=tir->gettReg()->getType();
     }
     return opdType;
@@ -1452,6 +1585,39 @@ vector<int> getDimen(past astnode){
     return arraysubs;
 }
 
+Type getParamType(past astnode){
+    Type paramType;
+    if(astnode->left!=NULL&&astnode->left->nodeType==ARRAY_SUBSCRIPT_EXPR){
+        vector<int> arraysubs=getDimenReverse(astnode->left);
+        arraysubs.erase(arraysubs.begin());
+        paramType.type=astnode->type;
+        paramType.arraysubs=arraysubs;
+        paramType.ptrDimen=1;
+        return paramType;
+    }
+    else{
+        paramType.type=astnode->type;
+        paramType.ptrDimen=0;
+        return paramType;
+    }
+}
+
+vector<int> getDimenReverse(past astnode){
+    if(astnode==NULL){
+        std::vector<int> emptyVector;
+        return emptyVector;
+    }
+    vector<int> arraysubs;
+    while(astnode!=NULL){
+        astnode->left=editBinaryOper(astnode->left, scope);
+        int dimen=calcDimen(astnode->left);
+        arraysubs.push_back(dimen);
+        astnode=astnode->right;
+    }
+    std::reverse(arraysubs.begin(), arraysubs.end());
+    return arraysubs;
+}
+
 int calcDimen(past astnode){
     //数组引用的情况稍后加上
     if(astnode->nodeType==INTEGER_LITERAL){
@@ -1479,7 +1645,7 @@ int calcDimen(past astnode){
     }
 }
 
-void  generateIR_InitList(past astnode,BasicBlock * curBblock,int index,Variable * array){
+void  generateIR_InitList(past astnode,BasicBlock * curBblock,int index,Variable * array,sVar * svar){
     if(astnode==NULL)
         return ;
     if(astnode->nodeType!=INIT_LIST_EXPR){
@@ -1495,8 +1661,7 @@ void  generateIR_InitList(past astnode,BasicBlock * curBblock,int index,Variable
                 curBblock->addIR(ir_getptr);
                 Instruction * ir_storeVal=generateIR_Tran(curBblock, val, tptr->getType());
                 if(tmpConstant * value=dynamic_cast<tmpConstant *>(ir_storeVal)){
-                    if(array->getType().isConst){
-                        sVar * svar=scope->lookup(array);
+                    if(array->getType().isConst||scope==globalScope){
                         Constant *initval=new Constant(value->getType(),value->getVal()->val);
                         svar->initVals[index]=initval;
                     }
@@ -1508,6 +1673,10 @@ void  generateIR_InitList(past astnode,BasicBlock * curBblock,int index,Variable
                     curBblock->addIR(ir_store);
                 }
                 else if(TypeTran * value=dynamic_cast<TypeTran *>(ir_storeVal)){
+                    Store * ir_store=new Store(tptr,value->gettReg());
+                    curBblock->addIR(ir_store);
+                }
+                else if(CallStmt * value=dynamic_cast<CallStmt *>(ir_storeVal)){
                     Store * ir_store=new Store(tptr,value->gettReg());
                     curBblock->addIR(ir_store);
                 }
@@ -1520,8 +1689,7 @@ void  generateIR_InitList(past astnode,BasicBlock * curBblock,int index,Variable
                 curBblock->addIR(ir_GEptr);
                 Instruction * ir_storeVal=generateIR_Tran(curBblock, val, tptr->getType());
                 if(tmpConstant * value=dynamic_cast<tmpConstant *>(ir_storeVal)){
-                    if(array->getType().isConst){
-                        sVar * svar=scope->lookup(array);
+                    if(array->getType().isConst||scope==globalScope){
                         Constant *initval=new Constant(value->getType(),value->getVal()->val);
                         svar->initVals[index]=initval;
                     }
@@ -1533,6 +1701,10 @@ void  generateIR_InitList(past astnode,BasicBlock * curBblock,int index,Variable
                     curBblock->addIR(ir_store);
                 }
                 else if(TypeTran * value=dynamic_cast<TypeTran *>(ir_storeVal)){
+                    Store * ir_store=new Store(tptr,value->gettReg());
+                    curBblock->addIR(ir_store);
+                }
+                else if(CallStmt * value=dynamic_cast<CallStmt *>(ir_storeVal)){
                     Store * ir_store=new Store(tptr,value->gettReg());
                     curBblock->addIR(ir_store);
                 }
@@ -1546,53 +1718,62 @@ void  generateIR_InitList(past astnode,BasicBlock * curBblock,int index,Variable
         int tmpindex=1;
         for(;i<=array->type.arraysubs.size()-1;i++)
             tmpindex*=array->type.arraysubs[i];
-        generateIR_InitList(astnode->left,curBblock,index,array);
-        generateIR_InitList(astnode->next,curBblock,index+tmpindex,array);
+        generateIR_InitList(astnode->left,curBblock,index,array,svar);
+        generateIR_InitList(astnode->next,curBblock,index+tmpindex,array,svar);
     }
 }
 
 SymbolEntry * getParam(past astnode,BasicBlock * curBblock,int index,Function * func){
+    astnode=editBinaryOper(astnode,scope);
     if(astnode->nodeType==DECL_REF_EXPR){
         sVar * svar=scope->lookup(astnode->svalue);
-            //生成IR
-        Variable *tReg=new Variable(svar->firstReg->type,"%"+to_string(regNum++),curFunc);
-        Load * ir_load=new Load(tReg,svar->firstReg);
-        curBblock->addIR(ir_load);
-        if(func->formalParameters[index].type==FLOAT
-            &&svar->firstReg->type.type==INT){
-            Variable * tmpReg=new Variable(Type(FLOAT,1),"%"+to_string(regNum++),curFunc);
-            TypeTran *ir_tran=new TypeTran(tReg,tmpReg,Type(INT,0),SITOFP);
-            curBblock->addIR(ir_tran);
-            return tmpReg;
-        }
-        if(func->formalParameters[index].type==INT
-            &&svar->firstReg->type.type==FLOAT){
-            Variable * tmpReg=new Variable(Type(INT,1),"%"+to_string(regNum++),curFunc);
-            TypeTran *ir_tran=new TypeTran(tReg,tmpReg,Type(FLOAT,0),FPTOSI);
-            curBblock->addIR(ir_tran);
-            return tmpReg;
-        }
-        return svar->firstReg;
+        if(svar->firstReg->type.arraysubs.size()!=0){
+            Variable * tReg=new Variable(svar->firstReg->type.getPtrType(),"%"+to_string(regNum++),curFunc);
+            GetElementPtr * ir_getptr=new GetElementPtr(svar->firstReg,0,tReg);
+            curBblock->addIR(ir_getptr);
+            Instruction *ir_tran=generateIR_Tran(curBblock,ir_getptr,func->paramsType[index]);
+            return getOpd(ir_tran);
+        }else{
+            Variable *tReg=new Variable(Type(svar->firstReg->type.type,0),"%"+to_string(regNum++),curFunc);
+            Load * ir_load=new Load(tReg,svar->firstReg);
+            curBblock->addIR(ir_load);
+            Instruction * ir_tran=generateIR_Tran(curBblock,ir_load,func->paramsType[index]);
+            return getOpd(ir_tran);
+        }  
     }
     else if(astnode->nodeType==INTEGER_LITERAL){
         Constant * intConst=new Constant(Type(INT,0),astnode->ivalue);
-        if(func->formalParameters[index].type==FLOAT){
+        if(func->paramsType[index].type==FLOAT){
             intConst->sitofp(Type(FLOAT,0));
         }
         return intConst;
     }
     else if(astnode->nodeType==FLOATING_LITERAL){
         Constant * floatConst=new Constant(Type(FLOAT,0),astnode->fvalue);
-        if(func->formalParameters[index].type==FLOAT){
+        if(func->paramsType[index].type==FLOAT){
             floatConst->fptosi(Type(INT,0));
         }
         return floatConst;
     }
     else if(astnode->nodeType==ARRAY_SUBSCRIPT_EXPR){
-        Instruction* ir_tmp=generateIR_Param_Array(astnode,curBblock);
-        if(GetElementPtr * ir_ptr=dynamic_cast<GetElementPtr *>(ir_tmp)){
-            return ir_ptr->getTptr();
+        if(isDeclDimenFull(astnode)){
+            Instruction* ir_tmp=generateIR_Param_Array(astnode,curBblock);
+            GetElementPtr * ir_tmp2=dynamic_cast<GetElementPtr *>(ir_tmp);
+            Variable * tReg=new Variable(Type(ir_tmp2->gettReg()->type.type,0),"%"+to_string(regNum++),curFunc);
+            Load * ir_load=new Load(tReg,ir_tmp2->gettReg());
+            curBblock->addIR(ir_load);
+            Instruction * ir_tran=generateIR_Tran(curBblock,  ir_load, func->paramsType[index]);
+            return getOpd(ir_tran);
         }
+        else{
+            Instruction* ir_tmp=generateIR_Param_Array(astnode,curBblock);
+            GetElementPtr * ir_tmp2=dynamic_cast<GetElementPtr *>(ir_tmp);
+            Variable * tReg=new Variable(ir_tmp2->gettReg()->getType().getPtrType(),"%"+to_string(regNum++),curFunc);
+            GetElementPtr * ir_newtmp=new GetElementPtr(ir_tmp2->gettReg(),0,tReg);
+            curBblock->addIR(ir_newtmp);
+            return getOpd(ir_newtmp);
+        }
+        
     }
 }
 
@@ -1600,20 +1781,39 @@ Instruction * generateIR_Param_Array(past astnode,BasicBlock * curBblock){
     if(astnode->nodeType!=ARRAY_SUBSCRIPT_EXPR)
         return NULL;
     if(astnode->right->nodeType==DECL_REF_EXPR){
+        Variable * sReg;
         sVar * svar=scope->lookup(astnode->right->svalue);
-        Variable *tReg=new Variable(svar->firstReg->type.getPtrType(),"%"+to_string(regNum++),curFunc);
-        GetElementPtr * ir_ptr=new GetElementPtr(svar->firstReg,astnode->left->ivalue,tReg);
+        sReg=svar->firstReg;
+        if(curFunc->isParamFind(svar->firstReg)){
+            Variable * var=new Variable(svar->firstReg->getType().getPtrType(),"%"+to_string(regNum++),curFunc);
+            Load * ir_load=new Load(var,svar->firstReg);
+            curBblock->addIR(ir_load);
+            sReg=var;
+            Variable *tReg=new Variable(sReg->type,"%"+to_string(regNum++),curFunc);
+            GetPtr * ir_ptr=new GetPtr(sReg,astnode->left->ivalue,tReg);
+            curBblock->addIR(ir_ptr);
+            return ir_ptr;
+        }
+        Variable *tReg=new Variable(sReg->type.getPtrType(),"%"+to_string(regNum++),curFunc);
+        GetElementPtr * ir_ptr=new GetElementPtr(sReg,astnode->left->ivalue,tReg);
         curBblock->addIR(ir_ptr);
         return ir_ptr;
     }
     else{
         Instruction * ir_tmp=generateIR_Param_Array(astnode->right,curBblock);
         if(GetElementPtr * ir_prePtr=dynamic_cast<GetElementPtr *>(ir_tmp)){
-            Variable *tReg=new Variable(ir_prePtr->getTptr()->type.getPtrType(),"%"+to_string(regNum++),curFunc);
-            GetElementPtr * ir_ptr=new GetElementPtr(ir_prePtr->getTptr(),astnode->left->ivalue,tReg);
+            Variable *tReg=new Variable(ir_prePtr->gettReg()->type.getPtrType(),"%"+to_string(regNum++),curFunc);
+            GetElementPtr * ir_ptr=new GetElementPtr(ir_prePtr->gettReg(),astnode->left->ivalue,tReg);
             curBblock->addIR(ir_ptr);
             return ir_ptr;
         }
+        if(GetPtr * ir_prePtr=dynamic_cast<GetPtr *>(ir_tmp)){
+            Variable *tReg=new Variable(ir_prePtr->gettReg()->type.getPtrType(),"%"+to_string(regNum++),curFunc);
+            GetElementPtr * ir_ptr=new GetElementPtr(ir_prePtr->gettReg(),astnode->left->ivalue,tReg);
+            curBblock->addIR(ir_ptr);
+            return ir_ptr;
+        }
+
     }
 }
 
@@ -1695,6 +1895,10 @@ past editWhileCond(past astnode){
         }
     }
     else if(astnode->nodeType==BINARY_OPERATOR||astnode->nodeType==UNARY_OPERATOR){
+        past newnode=editBinaryOper(astnode, scope);
+        return newnode;
+    }
+    else if(astnode->nodeType==DECL_REF_EXPR||astnode->nodeType==ARRAY_SUBSCRIPT_EXPR){
         past newnode=editBinaryOper(astnode, scope);
         return newnode;
     }
@@ -2119,6 +2323,9 @@ past editBinaryOper(past astnode,Scope* scope){
             return astnode;
         }
         if(svar->firstReg->getType().isConst){
+            if(svar->initVal==NULL){
+                return astnode;
+            }
             if(svar->firstReg->getType().type==FLOAT){
                 newnode=newFloatLiteral(svar->initVal->val.fval);
                 newnode->next=astnode->next;
@@ -2135,6 +2342,9 @@ past editBinaryOper(past astnode,Scope* scope){
     else if(astnode->nodeType==ARRAY_SUBSCRIPT_EXPR){
         past newnode;
         if(arrayIsConst(astnode)){
+            if(!isDeclDimenFull(astnode)){
+                return astnode;
+            }
             pair<int,sVar*> info=getArrayIndex(astnode, 0);
             if(info.second->initVals.find(info.first)==info.second->initVals.end()){
                 return astnode;
@@ -2178,6 +2388,21 @@ past editBinaryOper(past astnode,Scope* scope){
     }
     else{
         return astnode;
+    }
+}
+
+bool isDeclDimenFull(past astnode){
+    int i=0;
+    while(astnode->nodeType!=DECL_REF_EXPR){
+        i++;
+        astnode=astnode->right;
+    }
+    sVar *svar=scope->lookup(astnode->svalue);
+    if(i==svar->firstReg->type.arraysubs.size()){
+        return true;
+    }
+    else{
+        return false;
     }
 }
 
@@ -2287,6 +2512,66 @@ Instruction * generateIR_Tran(BasicBlock* bblock,Instruction * sir,Type ttype){
         return sir;
         
     }
+    SymbolEntry * sym=getOpd(sir);
+    if(Variable * var=dynamic_cast<Variable *>(sym)){
+        if(var->type.ptrDimen!=0){
+            if(var->type==ttype){
+                return sir;
+            }
+            else{
+                Variable * tReg=new Variable(ttype,"%"+to_string(regNum++),curFunc);
+                TypeTran * tir=new TypeTran(var,tReg,ttype,BITCAST);
+                bblock->addIR(tir);
+                return tir;
+            }
+        }
+        else{
+            if(var->getType().type==INT&&ttype.type==FLOAT){
+                Variable * newvar=new Variable(Type(FLOAT,0),"%"+to_string(regNum++),curFunc);
+                TypeTran * tir=new TypeTran(var,newvar,newvar->type,SITOFP);
+                bblock->addIR(tir);
+                return tir;
+            }
+            if(var->getType().type==INT&&ttype.type==I1){
+                Variable * newvar=new Variable(Type(I1,0),"%"+to_string(regNum++),curFunc);
+                TypeTran * tir=new TypeTran(var,newvar,newvar->type,TRUNC);
+                bblock->addIR(tir);
+                return tir;
+            }
+            if(var->getType().type==FLOAT&&ttype.type==INT){
+                Variable * newvar=new Variable(Type(INT,0),"%"+to_string(regNum++),curFunc);
+                TypeTran * tir=new TypeTran(var,newvar,newvar->type,FPTOSI);
+                bblock->addIR(tir);
+                return tir;
+            }
+            if(var->getType().type==FLOAT&&ttype.type==I1){
+                Variable * newvar=new Variable(Type(I1,0),"%"+to_string(regNum++),curFunc);
+                TypeTran * tir=new TypeTran(var,newvar,newvar->type,TRUNC);
+                bblock->addIR(tir);
+                return tir;
+            }
+            if(var->getType().type==I1&&ttype.type==INT){
+                Variable * newvar=new Variable(Type(INT,0),"%"+to_string(regNum++),curFunc);
+                TypeTran * tir=new TypeTran(var,newvar,newvar->type,ZEXT);
+                bblock->addIR(tir);
+                return tir;
+            }
+            if(var->getType().type==I1&&ttype.type==FLOAT){
+                Variable * newvar=new Variable(Type(FLOAT,0),"%"+to_string(regNum++),curFunc);
+                TypeTran * tir=new TypeTran(var,newvar,newvar->type,ZEXT);
+                bblock->addIR(tir);
+                return tir;
+            }
+            if(var->getType().type==INT&&ttype.type==FLOAT){
+                Variable * newvar=new Variable(Type(FLOAT,0),"%"+to_string(regNum++),curFunc);
+                TypeTran * tir=new TypeTran(var,newvar,newvar->type,SITOFP);
+                bblock->addIR(tir);
+                return tir;
+            }
+            return sir;
+        }
+    }
+    /*
     if(Load * ir_var=dynamic_cast<Load *>(sir)){
         if(ir_var->gettReg()->getType().arraysubs.size()!=0){
 
@@ -2437,6 +2722,57 @@ Instruction * generateIR_Tran(BasicBlock* bblock,Instruction * sir,Type ttype){
             return sir;
         }
     }
+    if(CallStmt * ir_var=dynamic_cast<CallStmt *>(sir)){
+        if(ir_var->gettReg()->getType().arraysubs.size()!=0){
+
+        }
+        else{
+            if(ir_var->gettReg()->getType().type==INT&&ttype.type==FLOAT){
+                Variable * newvar=new Variable(Type(FLOAT,0),"%"+to_string(regNum++),curFunc);
+                TypeTran * tir=new TypeTran(ir_var->gettReg(),newvar,newvar->type,SITOFP);
+                bblock->addIR(tir);
+                return tir;
+            }
+            if(ir_var->gettReg()->getType().type==INT&&ttype.type==I1){
+                Variable * newvar=new Variable(Type(I1,0),"%"+to_string(regNum++),curFunc);
+                TypeTran * tir=new TypeTran(ir_var->gettReg(),newvar,newvar->type,TRUNC);
+                bblock->addIR(tir);
+                return tir;
+            }
+            if(ir_var->gettReg()->getType().type==FLOAT&&ttype.type==INT){
+                Variable * newvar=new Variable(Type(INT,0),"%"+to_string(regNum++),curFunc);
+                TypeTran * tir=new TypeTran(ir_var->gettReg(),newvar,newvar->type,FPTOSI);
+                bblock->addIR(tir);
+                return tir;
+            }
+            if(ir_var->gettReg()->getType().type==FLOAT&&ttype.type==I1){
+                Variable * newvar=new Variable(Type(I1,0),"%"+to_string(regNum++),curFunc);
+                TypeTran * tir=new TypeTran(ir_var->gettReg(),newvar,newvar->type,TRUNC);
+                bblock->addIR(tir);
+                return tir;
+            }
+            if(ir_var->gettReg()->getType().type==I1&&ttype.type==INT){
+                Variable * newvar=new Variable(Type(INT,0),"%"+to_string(regNum++),curFunc);
+                TypeTran * tir=new TypeTran(ir_var->gettReg(),newvar,newvar->type,ZEXT);
+                bblock->addIR(tir);
+                return tir;
+            }
+            if(ir_var->gettReg()->getType().type==I1&&ttype.type==FLOAT){
+                Variable * newvar=new Variable(Type(FLOAT,0),"%"+to_string(regNum++),curFunc);
+                TypeTran * tir=new TypeTran(ir_var->gettReg(),newvar,newvar->type,ZEXT);
+                bblock->addIR(tir);
+                return tir;
+            }
+            if(ir_var->gettReg()->getType().type==INT&&ttype.type==FLOAT){
+                Variable * newvar=new Variable(Type(FLOAT,0),"%"+to_string(regNum++),curFunc);
+                TypeTran * tir=new TypeTran(ir_var->gettReg(),newvar,newvar->type,SITOFP);
+                bblock->addIR(tir);
+                return tir;
+            }
+            return sir;
+        }
+    }
+    */
     return sir;
 }
 
@@ -2484,23 +2820,63 @@ void freeAst_remainNext(past astnode){
 
 void dumpIR(IR * IRs){
     std::ofstream file("ir.txt");
-    for (auto bblocks = IRs->irs.begin(); bblocks != IRs->irs.end(); ++bblocks) {
-        file<<"define"<<" "<<symbolTable->lookupFunc(bblocks->first)->getRetType().TypeToString()
-            <<" "<<bblocks->first<<"(";
-            if(symbolTable->lookupFunc(bblocks->first)->formalParameters.size()==0){
-                file<<")";
-            }
-            for(auto param=symbolTable->lookupFunc(bblocks->first)->formalParameters.begin();
-                param!=symbolTable->lookupFunc(bblocks->first)->formalParameters.end();++param){
-                if(param==symbolTable->lookupFunc(bblocks->first)->formalParameters.end()-1){
-                    file<<param->TypeToString()<<")";
+    for (auto functionIR = IRs->irs.begin(); functionIR != IRs->irs.end(); ++functionIR) {
+        Function * function=symbolTable->lookupFunc(functionIR->first);
+        if(functionIR->first=="0GLOBAL"){
+            for(auto var=function->symbols.begin();var!=function->symbols.end();++var){
+                if(var->first[0]!='@')
+                    continue;
+                string str=var->first;
+                
+                sVar * svar=globalScope->lookup(str.erase(0,1));
+                if(var->second->type.isConst)
+                    file<<var->second->varname()<<" "<<"="<<" "<<"constant"<<" "<<var->second->type.TypeToString();
+                else
+                    file<<var->second->varname()<<" "<<"="<<" "<<"global"<<" "<<var->second->type.TypeToString();
+                if(var->second->type.arraysubs.size()!=0){
+                    int counter = var->second->type.arraysubs.back();
+                    int num=1;
+                    for(int i=0;i<var->second->type.arraysubs.size();i++)
+                        num*=var->second->type.arraysubs[i];
+                    for (int i=0;i<num; i++) {
+                        file<<"\n"<<"  ";
+                        if(svar->initVals.find(i)!=svar->initVals.end())
+                            file << i <<":"<<" "<< svar->initVals[i]->SymToString()<<","<<" ";
+                        else
+                            file<<i<<":"<<" "<<Type(var->second->type.type,0).TypeToString()<<" "<<"0"
+                                    <<","<<" ";
+                        if(i==num-1){
+                            file<<"\n";
+                        }
+                        else if ((i+1)%counter ==0 ) {
+                            file << "\n"<<"  ";
+                        }
+                    }
                 }
                 else{
-                    file<<param->TypeToString()<<","<<" ";
+                    file<<","<<" "<<svar->initVal->SymToString()<<"\n";
+                }
+            }
+            file<<"\n";
+            continue;
+        }
+        file<<"define"<<" "<<symbolTable->lookupFunc(functionIR->first)->getRetType().TypeToString()
+            <<" "<<functionIR->first<<"(";
+            if(function->formalParameters.size()==0){
+                file<<")";
+            }
+            for(auto paramtype=function->paramsType.begin();
+                paramtype!=function->paramsType.end();++paramtype){
+                if(paramtype==function->paramsType.end()-1){
+                    file<<(*paramtype).TypeToString()<<")";
+                }
+                else{
+                    file<<(*paramtype).TypeToString()<<","<<" ";
                 }
             }
             file<<" "<<"{"<<"\n";
-        for(auto bblock=(*bblocks).second.begin();bblock!=(*bblocks).second.end();++bblock){
+        
+        for(auto bblock=(*functionIR).second.begin();bblock!=(*functionIR).second.end();++bblock){
             file<<(*bblock)->bblockName()<<" "<<":"<<"\n";
             for(auto ir=(*bblock)->instructions.begin();ir!=(*bblock)->instructions.end();++ir){
                 if(Load * ir_load=dynamic_cast<Load *>(*ir)){
@@ -2510,10 +2886,8 @@ void dumpIR(IR * IRs){
                         <<ir_load->getsReg()->varname()<<'\n';
                 }
                 else if(Alloca * ir_alloca=dynamic_cast<Alloca *>(*ir)){
-                    Type tmpType=ir_alloca->gettReg()->type;
-                    tmpType.ptrDimen=0;
                     file<<"  "<<ir_alloca->gettReg()->varname()<<" "<<"="<<" "
-                        <<"alloca"<<" "<<tmpType.TypeToString()
+                        <<"alloca"<<" "<<ir_alloca->getType().TypeToString()
                         <<'\n';
                 }
                 else if(Store * ir_store=dynamic_cast<Store *>(*ir)){
@@ -2540,26 +2914,32 @@ void dumpIR(IR * IRs){
                         <<"\n";
                 }
                 else if(GetElementPtr * ir_ptr=dynamic_cast<GetElementPtr *>(*ir)){
-                    file<<"  "<<ir_ptr->getTptr()->varname()<<" "<<"="<<" "
-                        <<"getelementptr"<<" "<<ir_ptr->getSptr()->SymToString()<<","<<" "
+                    file<<"  "<<ir_ptr->gettReg()->varname()<<" "<<"="<<" "
+                        <<"getelementptr"<<" "<<ir_ptr->getsReg()->SymToString()<<","<<" "
                         <<to_string(ir_ptr->offset)<<"\n";
                 }
                 else if(GetPtr * ir_ptr=dynamic_cast<GetPtr *>(*ir)){
-                    file<<"  "<<ir_ptr->getTptr()->varname()<<" "<<"="<<" "
-                        <<"getptr"<<" "<<ir_ptr->getSptr()->SymToString()<<","<<" "
+                    file<<"  "<<ir_ptr->gettReg()->varname()<<" "<<"="<<" "
+                        <<"getptr"<<" "<<ir_ptr->getsReg()->SymToString()<<","<<" "
                         <<to_string(ir_ptr->offset)<<"\n";
                 }
                 else if(CallStmt * ir_call=dynamic_cast<CallStmt *>(*ir)){
-                    if(ir_call->getFunc()->getRetType().type==VOID){
-                        file<<"  "<<"call"<<" "<<"void"<<" "<<ir_call->getFunc()->getname()
-                            <<"(";
+                    file<<"  ";
+                    if(ir_call->gettReg()!=NULL){
+                        file<<ir_call->gettReg()->varname()<<" "<<"="<<" ";
+                    }
+                    file<<"call"<<" "<<ir_call->gettReg()->getType().TypeToString()<<" "
+                        <<ir_call->getFunc()->getname()<<"(";
+                    if(ir_call->params.size()!=0){    
                         for(auto it:ir_call->params){
-                            if(it!=*(ir_call->params.end()-1))
-                                file<<(*it).SymToString()<<","<<" ";
-                            else
-                                file<<it->SymToString()<<")"<<"\n";
+                        if(it!=*(ir_call->params.end()-1))
+                            file<<(*it).SymToString()<<","<<" ";
+                        else
+                            file<<it->SymToString()<<")"<<"\n";
                         }
                     }
+                    else
+                        file<<")"<<"\n";
                 }
                 else if(BinaryOperation * ir_bo=dynamic_cast<BinaryOperation *>(*ir)){
                     file<<"  "<<ir_bo->gettReg()->varname()<<" "<<"="<<" "

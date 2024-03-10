@@ -10,8 +10,7 @@
 #include<fstream>
 #include"ast.hpp"
 #include"parser.tab.hh"
-
-
+#include"tool.h"
 class Instruction;
 using std::vector;using std::string;using std::list;
 using std::map;
@@ -50,6 +49,14 @@ public:
     vector<int> arraysubs;
     int ptrDimen=0;
     bool isConst=false;
+    bool operator==(const Type& other) const {
+        // 在这里定义自定义的相等性比较规则
+        return (type == other.type 
+                && ptrDimen == other.ptrDimen
+                &&isConst==other.isConst
+                &&(areVectorsEqual(arraysubs,other.arraysubs)));
+    }
+
 };
 
 
@@ -65,16 +72,20 @@ class Function : public SymbolEntry {
 public:
     Function(std::string name, Type returnType)
         : name(name), returnType(returnType) {}
-    void addParm(Type type){formalParameters.push_back(type);return;}
+    void addParm(Type type,int regNum);
+    void addParm(Variable * parm){formalParameters.push_back(parm);}
     void addSymbols(Variable * variable);
     Variable * lookup(string name);
     string getname(){return name;}
-    std::vector<Type> formalParameters;
+    bool isParamFind(Variable * var);
+    std::vector<Variable *> formalParameters;
+    std::vector<Type> paramsType;
     Type getRetType(){return returnType;}
+    std::map<string,Variable *> symbols;
 private:
     std::string name;
     Type returnType;
-    std::map<string,Variable *> symbols;
+    
     //指令
 };
 
@@ -116,7 +127,7 @@ public:
     //Variable(Type type,string name,Function *function,vector<int> arraysubs)
      //   : type(type), name(name),function(function) {}
     Variable(Type type,string name,Function *function)
-        : type(type), name(name),function(function){}
+        : type(type), name(name),function(function){function->addSymbols(this);}
     string varname(){return name;}
     Type  getType(){return type;}
     bool isArray(void);

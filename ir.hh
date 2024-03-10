@@ -89,6 +89,7 @@ class Alloca : public Instruction {
 public:
     Alloca(Type type, Variable * tReg);
     Variable * gettReg(){return tReg;}
+    Type getType(){return type;}
 private:
     Type type;
     Variable * tReg;
@@ -151,11 +152,9 @@ private:
 class Global:public Instruction{
 public:
     Global(Variable *var,Constant * initVal,map<int,Constant*> initVals)
-    :var(var),initVal(initVal),initVals(initVals){}
+    :var(var){}
 private:
     Variable * var;
-    Constant * initVal;
-    map<int,Constant *> initVals;
 };
 
 class TypeTran:public Instruction{
@@ -181,8 +180,8 @@ public:
     GetElementPtr(Variable *sptr,int offset,Variable * tptr)
     :sptr(sptr),offset(offset),tptr(tptr){}
     
-    Variable * getTptr(){return tptr;}
-    Variable * getSptr(){return sptr;}
+    Variable * gettReg(){return tptr;}
+    Variable * getsReg(){return sptr;}
     int offset;
 private:
     Variable * sptr;
@@ -195,8 +194,8 @@ public:
     GetPtr(Variable *sptr,int offset,Variable * tptr)
     :sptr(sptr),offset(offset),tptr(tptr){}
     
-    Variable * getTptr(){return tptr;}
-    Variable * getSptr(){return sptr;}
+    Variable * gettReg(){return tptr;}
+    Variable * getsReg(){return sptr;}
     int offset;
 private:
     Variable * sptr;
@@ -209,10 +208,11 @@ public:
     CallStmt(Function * function):function(function){}
     void addParams(SymbolEntry* parameter){params.push_back(parameter);}
     void setRetVal(Variable * var){retVal=var;}
+    Variable * gettReg(){return retVal;}
     Function * getFunc(){return function;}
     vector<SymbolEntry *> params;
 private:
-    Variable * retVal;
+    Variable * retVal=NULL;
     
     Function * function;
 

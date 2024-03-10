@@ -10,15 +10,21 @@
 #include <vector>
 using std::string;
 
-
 Type Type::getPtrType(){
     Type ptrType=*this;
-    if(ptrDimen==0){
+    /*if(ptrDimen==0){
         ptrType.ptrDimen=1;
+        return ptrType;
+    }
+    else */if(ptrDimen>1){
+        ptrType.ptrDimen--;
         return ptrType;
     }
     else if(arraysubs.size()!=0&&ptrDimen==1){
         ptrType.arraysubs.erase(ptrType.arraysubs.begin());
+        return ptrType;
+    }
+    else{
         return ptrType;
     }
     
@@ -64,6 +70,13 @@ bool Variable::isConst(){
         return true;
     else
         return false;
+}
+
+bool Function::isParamFind(Variable *var){
+    if(std::find(formalParameters.begin(), formalParameters.end(), var)==formalParameters.end())
+        return false;
+    else
+        return true;
 }
 
 void Function::addSymbols(Variable * variable){
@@ -119,12 +132,19 @@ sVar * Scope::lookup(string name){
     Scope * tmp=this;
     sVar * var=tmp->lookupThis(name);
     while(var==NULL){
-        tmp=this->getpre();
+        tmp=tmp->getpre();
         if(tmp==NULL)
             break;
         var=tmp->lookupThis(name);
     }
     return var;
+}
+
+void Function::addParm(Type type,int regNUm){
+    Variable * parm=new Variable(type,"%"+std::to_string(regNUm),this);
+    formalParameters.push_back(parm);
+    return;
+
 }
 
 int Scope::getDimenInitVal(string name){
@@ -395,8 +415,11 @@ string Type::TypeToString(){
     if(type==VOID){
         typeStr+="void";
     }
-    if(ptrDimen!=0)
+    int tmp=ptrDimen;
+    while(tmp!=0){
         typeStr+="*";
+        tmp--;
+    }
     return typeStr;
     std::cout<<"type print error"<<std::endl;
 }
